@@ -250,6 +250,8 @@ function CreateInvoiceModal({ customers, products, onClose, onSaved }: {
     invoice_date: new Date().toISOString().split('T')[0],
     due_date: '',
     notes: '',
+    payment_type: 'credit' as 'credit' | 'partial' | 'full',
+    amount_paid: 0,
   });
   const [items, setItems] = useState<{ product_id: string; quantity: number; unit_price: number }[]>([]);
   const [saving, setSaving] = useState(false);
@@ -279,10 +281,14 @@ function CreateInvoiceModal({ customers, products, onClose, onSaved }: {
     return sum + (item.quantity * (item.unit_price || product?.sale_price || 0));
   }, 0);
 
+  const amountPaid = form.payment_type === 'full' ? subtotal : (form.payment_type === 'partial' ? form.amount_paid : 0);
+
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     if (!form.customer_id) { setError('Please select a customer'); return; }
     if (items.length === 0) { setError('Please add at least one item'); return; }
+    if (form.payment_type === 'partial' && form.amount_paid <= 0) { setError('Please enter payment amount for partial payment'); return; }
+    if (form.payment_type === 'partial' && form.amount_paid >= subtotal) { setError('Partial payment must be less than total. Use "Full Payment" instead.'); return; }
 
     setSaving(true);
     setError('');
@@ -299,9 +305,9 @@ function CreateInvoiceModal({ customers, products, onClose, onSaved }: {
         due_date: form.due_date || null,
         subtotal,
         total_amount: totalAmount,
-        amount_paid: 0,
-        balance_due: totalAmount,
-        status: 'draft',
+        amount_paid: amountPaid,
+        balance_due: totalAmount - amountPaid,
+        status: amountPaid >= totalAmount ? 'paid' : (amountPaid > 0 ? 'partially_paid' : 'draft'),
         is_pos: false,
         notes: form.notes || null,
       })
@@ -322,6 +328,40 @@ function CreateInvoiceModal({ customers, products, onClose, onSaved }: {
 
     const { error: itemsError } = await supabase.from('invoice_items').insert(invoiceItems);
     if (itemsError) { setError(itemsError.message); setSaving(false); return; }
+
+    // Record payment if full or partial
+    if (amountPaid > 0) {
+      const paymentNumber = `PAY-${Date.now().toString().slice(-6)}`;
+      await supabase.from('payments').insert({
+        payment_number: paymentNumber,
+        payment_type: 'received',
+        reference_type: 'invoice',
+        reference_id: invoice.id,
+        customer_id: form.customer_id,
+        amount: amountPaid,
+        payment_method: 'cash',
+        payment_date: form.invoice_date,
+        notes: form.payment_type === 'full' ? 'Full payment at invoice time' : 'Partial payment at invoice time',
+      });
+
+      // Update customer outstanding balance
+      const { data: currentCustomer } = await supabase
+        .from('customers')
+        .select('outstanding_balance, total_purchases')
+        .eq('id', form.customer_id)
+        .single();
+
+      if (currentCustomer) {
+        await supabase
+          .from('customers')
+          .update({
+            outstanding_balance: (currentCustomer.outstanding_balance || 0) + (totalAmount - amountPaid),
+            total_purchases: (currentCustomer.total_purchases || 0) + totalAmount,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', form.customer_id);
+      }
+    }
 
     toast({ title: 'Success', description: 'Invoice created successfully' });
     onSaved();
@@ -408,6 +448,57 @@ function CreateInvoiceModal({ customers, products, onClose, onSaved }: {
               <p className="text-xs text-muted-foreground">Subtotal</p>
               <p className="text-lg font-bold text-foreground">{formatCurrency(subtotal)}</p>
             </div>
+          </div>
+
+          <div className="border border-border rounded-lg p-4">
+            <label className="block text-xs font-medium mb-3">Payment Terms</label>
+            <div className="grid grid-cols-3 gap-3">
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'credit', amount_paid: 0 })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'credit' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <Clock className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">On Credit</p>
+                <p className="text-[10px] text-muted-foreground">Pay later</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'partial' })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'partial' ? 'border-amber-600 bg-amber-50 text-amber-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <DollarSign className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">Partial</p>
+                <p className="text-[10px] text-muted-foreground">Pay some now</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'full', amount_paid: subtotal })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'full' ? 'border-green-600 bg-green-50 text-green-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <CheckCircle2 className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">Full Payment</p>
+                <p className="text-[10px] text-muted-foreground">Pay all now</p>
+              </button>
+            </div>
+            {form.payment_type === 'partial' && (
+              <div className="mt-3">
+                <label className="block text-xs mb-1">Payment Amount</label>
+                <input
+                  type="number"
+                  min="0.01"
+                  max={subtotal - 0.01}
+                  step="0.01"
+                  value={form.amount_paid}
+                  onChange={e => setForm({ ...form, amount_paid: parseFloat(e.target.value) || 0 })}
+                  className="w-full border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                  placeholder={`Enter amount (Max: ${formatCurrency(subtotal)})`}
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Balance Due: {formatCurrency(subtotal - form.amount_paid)}
+                </p>
+              </div>
+            )}
           </div>
 
           <div>

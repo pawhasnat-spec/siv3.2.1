@@ -226,6 +226,8 @@ function CreatePOModal({ suppliers, products, onClose, onSaved }: {
     order_date: new Date().toISOString().split('T')[0],
     expected_date: '',
     notes: '',
+    payment_type: 'credit' as 'credit' | 'partial' | 'full',
+    amount_paid: 0,
   });
   const [items, setItems] = useState<{ product_id: string; quantity: number; unit_price: number }[]>([]);
   const [saving, setSaving] = useState(false);
@@ -255,10 +257,14 @@ function CreatePOModal({ suppliers, products, onClose, onSaved }: {
     return sum + (item.quantity * (item.unit_price || product?.cost_price || 0));
   }, 0);
 
+  const amountPaid = form.payment_type === 'full' ? subtotal : (form.payment_type === 'partial' ? form.amount_paid : 0);
+
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     if (!form.supplier_id) { setError('Please select a supplier'); return; }
     if (items.length === 0) { setError('Please add at least one item'); return; }
+    if (form.payment_type === 'partial' && form.amount_paid <= 0) { setError('Please enter payment amount for partial payment'); return; }
+    if (form.payment_type === 'partial' && form.amount_paid >= subtotal) { setError('Partial payment must be less than total. Use "Full Payment" instead.'); return; }
 
     setSaving(true);
     setError('');
@@ -274,8 +280,9 @@ function CreatePOModal({ suppliers, products, onClose, onSaved }: {
         expected_date: form.expected_date || null,
         subtotal,
         total_amount: subtotal,
-        amount_paid: 0,
+        amount_paid: amountPaid,
         status: 'draft',
+        notes: form.notes || null,
       })
       .select()
       .single();
@@ -286,12 +293,46 @@ function CreatePOModal({ suppliers, products, onClose, onSaved }: {
       purchase_order_id: po.id,
       product_id: item.product_id,
       quantity: item.quantity,
-      unit_price: item.unit_price,
+      unit_cost: item.unit_price,
       subtotal: item.quantity * item.unit_price,
     }));
 
     const { error: itemsError } = await supabase.from('purchase_order_items').insert(poItems);
     if (itemsError) { setError(itemsError.message); setSaving(false); return; }
+
+    // Record payment if full or partial
+    if (amountPaid > 0) {
+      const paymentNumber = `POPAY-${Date.now().toString().slice(-6)}`;
+      await supabase.from('payments').insert({
+        payment_number: paymentNumber,
+        payment_type: 'made',
+        reference_type: 'purchase_order',
+        reference_id: po.id,
+        supplier_id: form.supplier_id,
+        amount: amountPaid,
+        payment_method: 'bank_transfer',
+        payment_date: form.order_date,
+        notes: form.payment_type === 'full' ? 'Full payment at order time' : 'Partial payment at order time',
+      });
+
+      // Update supplier outstanding balance
+      const { data: currentSupplier } = await supabase
+        .from('suppliers')
+        .select('outstanding_balance, total_purchases')
+        .eq('id', form.supplier_id)
+        .single();
+
+      if (currentSupplier) {
+        await supabase
+          .from('suppliers')
+          .update({
+            outstanding_balance: (currentSupplier.outstanding_balance || 0) + (subtotal - amountPaid),
+            total_purchases: (currentSupplier.total_purchases || 0) + subtotal,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', form.supplier_id);
+      }
+    }
 
     toast({ title: 'Success', description: 'Purchase order created successfully' });
     onSaved();
@@ -377,6 +418,57 @@ function CreatePOModal({ suppliers, products, onClose, onSaved }: {
             </div>
           </div>
 
+          <div className="border border-border rounded-lg p-4">
+            <label className="block text-xs font-medium mb-3">Payment Type *</label>
+            <div className="grid grid-cols-3 gap-3">
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'credit', amount_paid: 0 })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'credit' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <CreditCard className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">Full Credit</p>
+                <p className="text-[10px] text-muted-foreground">Pay later</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'partial' })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'partial' ? 'border-amber-600 bg-amber-50 text-amber-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <DollarSign className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">Partial</p>
+                <p className="text-[10px] text-muted-foreground">Pay some now</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setForm({ ...form, payment_type: 'full', amount_paid: subtotal })}
+                className={`p-3 border rounded-lg text-center transition ${form.payment_type === 'full' ? 'border-green-600 bg-green-50 text-green-700' : 'border-border hover:border-gray-300'}`}
+              >
+                <CheckCircle className="w-5 h-5 mx-auto mb-1" />
+                <p className="text-xs font-medium">Full Payment</p>
+                <p className="text-[10px] text-muted-foreground">Pay all now</p>
+              </button>
+            </div>
+            {form.payment_type === 'partial' && (
+              <div className="mt-3">
+                <label className="block text-xs mb-1">Payment Amount</label>
+                <input
+                  type="number"
+                  min="0.01"
+                  max={subtotal - 0.01}
+                  step="0.01"
+                  value={form.amount_paid}
+                  onChange={e => setForm({ ...form, amount_paid: parseFloat(e.target.value) || 0 })}
+                  className="w-full border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                  placeholder={`Enter amount (Max: ${formatCurrency(subtotal)})`}
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Balance Due: {formatCurrency(subtotal - form.amount_paid)}
+                </p>
+              </div>
+            )}
+          </div>
+
           <div className="flex items-center justify-end gap-3 pt-2">
             <button type="button" onClick={onClose} className="px-4 py-2 border border-border rounded-lg text-sm hover:bg-muted transition">Cancel</button>
             <button type="submit" disabled={saving} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-semibold transition disabled:opacity-60">
@@ -459,7 +551,7 @@ function ViewPOModal({ order, items, onClose, onUpdateStatus, onRecordPayment }:
                     <tr key={idx}>
                       <td className="px-3 py-2 text-sm">{item.product?.name || '-'}</td>
                       <td className="px-3 py-2 text-sm text-right">{item.quantity}</td>
-                      <td className="px-3 py-2 text-sm text-right">{formatCurrency(item.unit_price)}</td>
+                      <td className="px-3 py-2 text-sm text-right">{formatCurrency(item.unit_cost || item.unit_price)}</td>
                       <td className="px-3 py-2 text-sm text-right font-semibold">{formatCurrency(item.subtotal)}</td>
                     </tr>
                   ))}
